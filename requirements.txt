@@ -1,0 +1,16 @@
+# Drive -> Qwen (LM Studio) -> MCP -> Excel invoice pipeline.
+#
+# TARGET OFFICE PC:
+#   * Python 3.10 or newer is required (3.11+ / 3.12 recommended).
+#   * Install with:  python -m pip install -r requirements.txt
+#   * No additional MCP dependency is needed: src/mcp/ is stdlib-only
+#     (JSON-RPC 2.0 over stdio).
+
+google-api-python-client>=2.140.0
+google-auth>=2.34.0
+openai>=1.50.0
+openpyxl>=3.1.5
+pypdf>=4.3.0
+pypdfium2>=4.30.0
+pillow>=10.4.0
+requests>=2.32.0
