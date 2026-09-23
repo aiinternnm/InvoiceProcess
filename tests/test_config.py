@@ -38,7 +38,7 @@ class ConfigTest(unittest.TestCase):
         p = _minimal_cfg(self.tmp.name, self.wb)
         cfg = load_config(p)
         self.assertEqual(cfg["model"]["base_url"], "http://localhost:1234/v1")
-        self.assertEqual(cfg["model"]["max_tokens"], 4096)
+        self.assertEqual(cfg["model"]["max_tokens"], 8192)
         self.assertEqual(cfg["excel"]["flush_every_n"], 1)
         self.assertEqual(cfg["filtering"]["min_file_size_kb"], 25)
         self.assertTrue(cfg["drive"]["recursive"])
@@ -127,6 +127,39 @@ class ConfigTest(unittest.TestCase):
         for d in ("downloads", os.path.join("state"), "audit", "backups"):
             self.assertTrue(os.path.isdir(os.path.join(self.tmp.name, "data", d)),
                             d)
+
+    def _drive_cfg(self, extra):
+        cfg = {
+            "drive": dict({"folder_id": "folder123"}, **extra),
+            "excel": {"template_path": os.path.abspath(self.wb)},
+            "model": {"base_url": "http://localhost:1234/v1", "model": "m"},
+        }
+        p = os.path.join(self.tmp.name, "shared.json")
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh)
+        return p
+
+    def test_corpora_drive_without_drive_id_rejected(self):
+        p = self._drive_cfg({"corpora": "drive"})
+        with self.assertRaises(ValueError):
+            load_config(p)
+
+    def test_corpora_drive_with_drive_id_accepted(self):
+        p = self._drive_cfg({"corpora": "drive", "drive_id": "0A-SHARED"})
+        cfg = load_config(p)
+        self.assertEqual(cfg["drive"]["corpora"], "drive")
+        self.assertEqual(cfg["drive"]["drive_id"], "0A-SHARED")
+
+    def test_invalid_corpora_rejected(self):
+        p = self._drive_cfg({"corpora": "nonsense"})
+        with self.assertRaises(ValueError):
+            load_config(p)
+
+    def test_corpora_defaults_empty(self):
+        p = _minimal_cfg(self.tmp.name, self.wb)
+        cfg = load_config(p)
+        self.assertEqual(cfg["drive"]["corpora"], "")
+        self.assertEqual(cfg["drive"]["drive_id"], "")
 
 
 if __name__ == "__main__":

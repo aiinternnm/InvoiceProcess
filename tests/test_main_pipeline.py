@@ -87,7 +87,7 @@ class FakeDrive:
         self.files = files
         self.content = content  # id -> source path
 
-    def list_folder(self, folder_id, recursive=True, allowed_extensions=None):
+    def list_folder(self, folder_id, recursive=True, allowed_extensions=None, **kwargs):
         return list(self.files)
 
     def download(self, file_meta, dest_dir, max_size_mb=None, verify_md5=False):
@@ -427,6 +427,90 @@ class PipelineEndToEndTest(unittest.TestCase):
                 "mcp": {"enabled": True, "transport": "inproc"}})
         self.assertEqual(code, 4)
         self.assertEqual(len(self._read_details()), 0)
+
+
+    def test_17_step_mode_stops_after_first_file_on_no(self):
+        content, files = {}, []
+        for i, fid in enumerate(["fA", "fB", "fC"], start=1):
+            content[fid] = self._pdf_file(f"{fid}.pdf", self._invoice_pdf_text(f"INV-S{i}"))
+            files.append(self._meta(fid, f"{fid}.pdf"))
+            FakeExtractor.behaviors[fid] = _invoice(number=f"INV-S{i}")
+        with mock.patch("builtins.input", return_value="n"):
+            code = self._run(files, content, "--step")
+        self.assertEqual(code, 0)
+        rows = self._read_details()
+        self.assertEqual([r["InvoiceNo"] for r in rows], ["INV-S1"])
+        self.assertEqual(len(self._audit_records()), 1)
+
+    def test_18_step_mode_continues_then_stops(self):
+        content, files = {}, []
+        for i, fid in enumerate(["fA", "fB", "fC"], start=1):
+            content[fid] = self._pdf_file(f"{fid}.pdf", self._invoice_pdf_text(f"INV-C{i}"))
+            files.append(self._meta(fid, f"{fid}.pdf"))
+            FakeExtractor.behaviors[fid] = _invoice(number=f"INV-C{i}")
+        with mock.patch("builtins.input", side_effect=["y", "n"]):
+            code = self._run(files, content, "--step")
+        self.assertEqual(code, 0)
+        rows = self._read_details()
+        self.assertEqual([r["InvoiceNo"] for r in rows], ["INV-C1", "INV-C2"])
+        self.assertEqual(len(self._audit_records()), 2)
+
+
+    def test_19_limit_processes_only_first_n(self):
+        content, files = {}, []
+        for i, fid in enumerate(["fA", "fB", "fC"], start=1):
+            content[fid] = self._pdf_file(f"{fid}.pdf", self._invoice_pdf_text(f"INV-L{i}"))
+            files.append(self._meta(fid, f"{fid}.pdf"))
+            FakeExtractor.behaviors[fid] = _invoice(number=f"INV-L{i}")
+        code = self._run(files, content, "--limit", "2")
+        self.assertEqual(code, 0)
+        rows = self._read_details()
+        self.assertEqual([r["InvoiceNo"] for r in rows], ["INV-L1", "INV-L2"])
+        self.assertEqual(len(self._audit_records()), 2)
+
+
+    def test_20_main_forwards_shared_drive_params_from_config(self):
+        class RecordingDrive:
+            def __init__(self):
+                self.kwargs = {}
+
+            def list_folder(self, folder_id, **kwargs):
+                self.kwargs = {"folder_id": folder_id, "kwargs": kwargs}
+                return []
+
+        drive_cfg = {
+            "service_account_json": os.path.abspath(self.cfg_path),
+            "folder_id": "MYFOLDER",
+            "recursive": True,
+            "corpora": "drive",
+            "drive_id": "0A-SHARED123",
+            "allowed_extensions": [".pdf"],
+            "download_dir": os.path.join(self.tmp.name, "downloads"),
+            "max_file_size_mb": 50,
+            "delete_temp_files": False,
+        }
+        rec = RecordingDrive()
+        code = self._run([], {}, "--dry-run", drive=rec,
+                         cfg_overrides={"drive": drive_cfg})
+        self.assertEqual(code, 0)
+        self.assertEqual(rec.kwargs["folder_id"], "MYFOLDER")
+        self.assertEqual(rec.kwargs["kwargs"].get("corpora"), "drive")
+        self.assertEqual(rec.kwargs["kwargs"].get("drive_id"), "0A-SHARED123")
+
+    def test_21_main_omits_shared_drive_params_when_not_configured(self):
+        class RecordingDrive:
+            def __init__(self):
+                self.kwargs = {}
+
+            def list_folder(self, folder_id, **kwargs):
+                self.kwargs = {"folder_id": folder_id, "kwargs": kwargs}
+                return []
+
+        rec = RecordingDrive()
+        code = self._run([], {}, "--dry-run", drive=rec)
+        self.assertEqual(code, 0)
+        self.assertNotIn("corpora", rec.kwargs["kwargs"])
+        self.assertNotIn("drive_id", rec.kwargs["kwargs"])
 
 
 if __name__ == "__main__":

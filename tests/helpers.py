@@ -100,7 +100,13 @@ class _Handler(BaseHTTPRequestHandler):
         elif server.mode == "bad_json":
             server.payload_callback = lambda req: "this is definitely not JSON"
 
-        content = server.payload_callback(body)
+        script = getattr(server, "script", None)
+        if script:
+            idx = len(server.requests) - 1
+            step = script[idx] if idx < len(script) else script[-1]
+            content = step(body) if callable(step) else step
+        else:
+            content = server.payload_callback(body)
         if not isinstance(content, str):
             content = json.dumps(content, ensure_ascii=False)
         messages = body.get("messages", [])
@@ -118,7 +124,7 @@ class _Handler(BaseHTTPRequestHandler):
             "choices": [{
                 "index": 0,
                 "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop",
+                "finish_reason": server.finish_reason,
             }],
             "usage": {
                 "prompt_tokens": 12,
@@ -126,6 +132,14 @@ class _Handler(BaseHTTPRequestHandler):
                 "total_tokens": 19,
             },
         }
+        # Qwen3.5 (LM Studio) emits reasoning_content before the final answer and
+        # counts it against max_tokens. Simulate it so the extractor's handling of
+        # thinking models is exercised without a real model.
+        if server.reasoning_only:
+            payload["choices"][0]["message"]["content"] = ""
+            payload["choices"][0]["message"]["reasoning_content"] = server.reasoning_text
+        elif server.reasoning:
+            payload["choices"][0]["message"]["reasoning_content"] = server.reasoning_text
         if saw_image:
             payload["_saw_image"] = True
         self._json(200, payload)
@@ -144,11 +158,23 @@ class FakeLMStudioServer:
 
     MODES = ("ok", "bad_json", "no_response_format", "fail_then_ok")
 
-    def __init__(self, mode: str = "ok", payload=None, fail_until: int = 2):
+    def __init__(self, mode: str = "ok", payload=None, fail_until: int = 2,
+                 reasoning: bool = False, reasoning_text: Optional[str] = None,
+                 reasoning_only: bool = False, finish_reason: str = "stop",
+                 script: Optional[list] = None):
         assert mode in self.MODES, mode
         self.mode = mode
         self.fail_until = fail_until
         self.fail_count = 0
+        self.reasoning = reasoning
+        self.reasoning_text = reasoning_text or (
+            "I will extract the invoice fields step by step. First the seller and GSTIN, "
+            "then the line items, then the tax arithmetic: CGST plus SGST should equal "
+            "the difference between the grand total and the taxable value."
+        )
+        self.reasoning_only = reasoning_only
+        self.finish_reason = finish_reason
+        self.script = script  # per-request reply: str/dict or callable(body)
         self.requests: List[Dict[str, Any]] = []
         default = {
             "invoice_number": "INV-STUB-1",
@@ -172,6 +198,11 @@ class FakeLMStudioServer:
         self._httpd.mode = self.mode
         self._httpd.fail_count = 0
         self._httpd.fail_until = self.fail_until
+        self._httpd.reasoning = self.reasoning
+        self._httpd.reasoning_text = self.reasoning_text
+        self._httpd.reasoning_only = self.reasoning_only
+        self._httpd.finish_reason = self.finish_reason
+        self._httpd.script = self.script
         self._httpd.payload_callback = self.payload_callback
         self.port = self._httpd.server_address[1]
         self.base_url = f"http://127.0.0.1:{self.port}/v1"

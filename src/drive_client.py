@@ -62,18 +62,39 @@ class DriveClient:
 
     # ---- listing ----------------------------------------------------------
     def list_folder(self, folder_id: str, recursive: bool = True,
-                    allowed_extensions: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+                    allowed_extensions: Optional[List[str]] = None,
+                    corpora: Optional[str] = None,
+                    drive_id: Optional[str] = None) -> List[Dict[str, Any]]:
         svc = self._get_service()
         allowed = [e.lower() for e in (allowed_extensions or [])]
         out: List[Dict[str, Any]] = []
 
         def walk(current: str, depth: int) -> None:
+            # Minimal valid shared-drive request (works for both My Drive and
+            # Shared Drive folders): supportsAllDrives + includeItemsFromAllDrives.
+            # The optional corpora/driveId narrow the search to one shared drive
+            # (recommended; avoids the allDrives incompleteSearch risk).
+            base_params: Dict[str, Any] = {
+                "pageSize": 1000,
+                "fields": f"nextPageToken,{_FIELDS}",
+                "supportsAllDrives": True,
+                "includeItemsFromAllDrives": True,
+            }
+            if corpora:
+                base_params["corpora"] = corpora
+                if corpora == "drive":
+                    if not drive_id:
+                        raise DriveError(
+                            "drive.corpora='drive' requires drive.drive_id set to the "
+                            "top-level Shared Drive ID."
+                        )
+                    base_params["driveId"] = drive_id
             q = f"'{current}' in parents and trashed=false"
             token = None
             while True:
                 try:
                     resp = svc.files().list(
-                        q=q, pageSize=1000, fields=f"nextPageToken,{_FIELDS}", pageToken=token
+                        q=q, pageToken=token, **base_params
                     ).execute()
                 except HttpError as exc:
                     raise DriveError(f"files.list failed for {current}: {exc}") from exc

@@ -18,6 +18,7 @@ from PIL import Image  # noqa: E402
 
 from src.extractor import Extractor, ExtractorError  # noqa: E402
 from src.utils import parse_number  # noqa: E402
+from src.validator import validate_extraction  # noqa: E402
 from tests.helpers import FakeLMStudioServer, build_text_pdf  # noqa: E402
 
 VALID_INVOICE = {
@@ -33,6 +34,32 @@ VALID_INVOICE = {
     "uncertain_fields": [],
     "line_items": [],
 }
+
+# Canonical-schema XML the extractor must parse into the same shape as JSON.
+XML_INVOICE = """<invoice>
+  <invoice_number>INV-XML-2026-042</invoice_number>
+  <invoice_date>2026-09-02</invoice_date>
+  <vendor_name>XML Traders</vendor_name>
+  <vendor_gstin>27AAACS5842A1ZD</vendor_gstin>
+  <taxable_value>10000</taxable_value>
+  <cgst_amount>900</cgst_amount>
+  <sgst_amount>900</sgst_amount>
+  <total_amount>11800</total_amount>
+  <confidence>0.97</confidence>
+  <uncertain_fields/>
+  <line_items>
+    <line_item>
+      <sl_no>1</sl_no>
+      <description>Item One</description>
+      <qty>2</qty>
+      <unit>Pcs</unit>
+      <taxable_value>5000</taxable_value>
+      <cgst_amount>450</cgst_amount>
+      <sgst_amount>450</sgst_amount>
+      <line_total>5900</line_total>
+    </line_item>
+  </line_items>
+</invoice>"""
 
 
 def _cfg(base_url: str, **over) -> dict:
@@ -175,6 +202,189 @@ class ExtractorLiveProtocolTest(unittest.TestCase):
             _, meta = ex._chat_json([{"role": "user", "content": "hi"}], "x.pdf")
             self.assertEqual(meta["input_tokens"], 12)
             self.assertEqual(meta["output_tokens"], 7)
+
+    # ---- Qwen3.5 thinking-model behaviour (LM Studio) --------------------
+    def test_response_format_fallback_with_reasoning_extracts_end_to_end(self):
+        # Qwen3.5: response_format rejected AND the model thinks first, yet still
+        # emits the final JSON in content. The fallback must succeed through the
+        # full extract() path (message build -> call -> parse -> validate).
+        with FakeLMStudioServer(mode="no_response_format", reasoning=True) as srv:
+            ex = Extractor(_cfg(srv.base_url))
+            fp = self._pdf("INVOICE INV-2026-1001 GSTIN 27AAACS5842A1ZD taxable "
+                           "10000 CGST 900 SGST 900 grand total 11800")
+            res = ex.extract(fp, "application/pdf")
+            self.assertEqual(res["data"]["invoice_number"], "INV-STUB-1")
+            self.assertEqual(res["meta"]["status"], "ok")
+            self.assertEqual(len(srv.requests), 2)
+            self.assertIn("response_format", srv.requests[0])
+            self.assertNotIn("response_format", srv.requests[1])
+            # reasoning_content flowed through and is surfaced as a diagnostic
+            self.assertGreater(res["meta"]["reasoning_chars"], 0)
+
+    def test_reasoning_only_content_gives_actionable_error(self):
+        # Qwen consumed the whole completion budget on thinking; content empty.
+        with FakeLMStudioServer(mode="no_response_format", reasoning_only=True,
+                                finish_reason="length") as srv:
+            ex = Extractor(_cfg(srv.base_url))
+            with self.assertRaises(ExtractorError) as cm:
+                ex._chat_json([{"role": "user", "content": "hi"}], "x.pdf")
+            msg = str(cm.exception)
+            self.assertIn("max_tokens", msg)
+            self.assertRegex(msg, r"truncated|reasoning")
+
+    def test_truncated_json_surfaces_finish_reason(self):
+        truncated = '{"invoice_number": "INV-1", "total_amount": 1'  # cut mid-string
+        with FakeLMStudioServer(payload=truncated, finish_reason="length") as srv:
+            ex = Extractor(_cfg(srv.base_url))
+            with self.assertRaises(ExtractorError) as cm:
+                ex._chat_json([{"role": "user", "content": "hi"}], "x.pdf")
+            self.assertIn("truncated", str(cm.exception))
+            self.assertIn("max_tokens", str(cm.exception))
+
+    # ---- JSON (primary) -> XML (fallback) ----------------------------------
+    def _xml_pdf(self):
+        return self._pdf("INVOICE INV-2026-1001 GSTIN 27AAACS5842A1ZD "
+                         "taxable 10000 CGST 900 SGST 900 grand total 11800")
+
+    def test_json_success_records_source_format(self):
+        with FakeLMStudioServer() as srv:
+            ex = Extractor(_cfg(srv.base_url))
+            res = ex.extract(self._xml_pdf(), "application/pdf")
+            self.assertEqual(res["meta"]["source_format"], "json")
+            self.assertIs(res["meta"]["xml_fallback"], False)
+            self.assertEqual(len(srv.requests), 1)
+
+    def test_json_parse_failure_triggers_xml_fallback(self):
+        # malformed JSON -> exactly ONE controlled XML request -> canonical object
+        with FakeLMStudioServer(script=[
+            lambda body: "this is definitely not JSON",
+            lambda body: XML_INVOICE,
+        ]) as srv:
+            ex = Extractor(_cfg(srv.base_url))
+            res = ex.extract(self._xml_pdf(), "application/pdf")
+            self.assertEqual(res["data"]["invoice_number"], "INV-XML-2026-042")
+            self.assertEqual(res["data"]["vendor_name"], "XML Traders")
+            self.assertEqual(res["meta"]["source_format"], "xml")
+            self.assertTrue(res["meta"]["xml_fallback"])
+            self.assertIn("non-JSON", res["meta"]["json_error"])
+            self.assertEqual(len(srv.requests), 2)
+            last = srv.requests[1]["messages"][-1]["content"]
+            self.assertIn("<invoice>", last)
+
+    def test_schema_invalid_json_triggers_xml_fallback(self):
+        # JSON parses but is reject-level (no anchor fields) -> XML re-request
+        with FakeLMStudioServer(script=[
+            {"invoice_number": None, "total_amount": None,
+             "taxable_value": None, "line_items": []},
+            lambda body: XML_INVOICE,
+        ]) as srv:
+            ex = Extractor(_cfg(srv.base_url))
+            res = ex.extract(self._xml_pdf(), "application/pdf")
+            self.assertEqual(res["meta"]["source_format"], "xml")
+            self.assertEqual(res["data"]["invoice_number"], "INV-XML-2026-042")
+            self.assertEqual(len(srv.requests), 2)
+            # the XML-derived canonical object passes the SAME downstream validator
+            vr = validate_extraction(
+                Extractor._parse_xml(XML_INVOICE), {"duplicates": {}, "extraction": {}})
+            self.assertEqual(vr.decision, "ok")
+            self.assertEqual(vr.data["total_amount"], 11800.0)
+
+    def test_xml_fallback_both_fail_raises(self):
+        with FakeLMStudioServer(script=[
+            "not json at all",
+            lambda body: "this is not xml either <<<",
+        ]) as srv:
+            ex = Extractor(_cfg(srv.base_url))
+            with self.assertRaises(ExtractorError) as cm:
+                ex.extract(self._xml_pdf(), "application/pdf")
+            self.assertIn("Both JSON and XML", str(cm.exception))
+
+    def test_xxe_guard_blocks_doctype_in_xml_fallback(self):
+        evil = ('<!DOCTYPE invoice [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>'
+                "<invoice>&xxe;</invoice>")
+        with FakeLMStudioServer(script=["not json", lambda body: evil]) as srv:
+            ex = Extractor(_cfg(srv.base_url))
+            with self.assertRaises(ExtractorError) as cm:
+                ex.extract(self._xml_pdf(), "application/pdf")
+            self.assertIn("XXE", str(cm.exception))
+
+
+class XmlParseUnitTest(unittest.TestCase):
+    """Deterministic XML -> canonical-object mapping used by the fallback."""
+
+    def test_parse_xml_full_invoice(self):
+        data = Extractor._parse_xml(XML_INVOICE)
+        self.assertEqual(data["invoice_number"], "INV-XML-2026-042")
+        self.assertEqual(data["taxable_value"], "10000")
+        self.assertEqual(len(data["line_items"]), 1)
+        self.assertEqual(data["line_items"][0]["description"], "Item One")
+        self.assertEqual(data["line_items"][0]["sl_no"], "1")
+        self.assertEqual(data["uncertain_fields"], [])
+
+    def test_parse_xml_fenced(self):
+        data = Extractor._parse_xml("```xml\n" + XML_INVOICE + "\n```")
+        self.assertEqual(data["invoice_number"], "INV-XML-2026-042")
+
+    def test_parse_xml_namespace_tolerant(self):
+        ns = XML_INVOICE.replace("<invoice>", '<invoice xmlns="urn:x">')
+        data = Extractor._parse_xml(ns)
+        self.assertEqual(data["invoice_number"], "INV-XML-2026-042")
+
+    def test_parse_xml_uncertain_fields(self):
+        data = Extractor._parse_xml(
+            "<invoice><invoice_number>I-1</invoice_number>"
+            "<uncertain_fields><field>due_date</field><field>total_amount</field>"
+            "</uncertain_fields><line_items/></invoice>")
+        self.assertEqual(data["uncertain_fields"], ["due_date", "total_amount"])
+        self.assertEqual(data["line_items"], [])
+
+    def test_parse_xml_rejects_doctype(self):
+        evil = ('<!DOCTYPE a [<!ENTITY x SYSTEM "file:///etc/passwd">]>'
+                "<invoice>&x;</invoice>")
+        with self.assertRaises(ExtractorError) as cm:
+            Extractor._parse_xml(evil)
+        self.assertIn("XXE", str(cm.exception))
+
+    def test_parse_xml_malformed_raises(self):
+        with self.assertRaises(ExtractorError):
+            Extractor._parse_xml("<invoice><broken></invoice>")
+
+    def test_parse_xml_empty_content_raises(self):
+        with self.assertRaises(ExtractorError):
+            Extractor._parse_xml("   ")
+
+
+class JsonParseRobustnessTest(unittest.TestCase):
+    """Qwen3.5 replies may embed reasoning/fences/brace fragments around the JSON."""
+
+    def test_reasoning_pretext_with_brace_fragment_ignored(self):
+        raw = "The table starts with a {\"qty\": 1} note, now the real JSON: " + json.dumps(VALID_INVOICE)
+        data = Extractor._parse_json(raw)
+        self.assertEqual(data["invoice_number"], "INV-STUB-2026-001")
+        self.assertEqual(data["total_amount"], 11800.0)
+
+    def test_reasoning_after_json_ignored(self):
+        raw = json.dumps(VALID_INVOICE) + " Re-checked: 900 + 900 = 1800, total 11800 ok"
+        data = Extractor._parse_json(raw)
+        self.assertEqual(data["total_amount"], 11800.0)
+
+    def test_picks_full_invoice_over_smaller_fragments(self):
+        raw = "{ \"note\": { \"code\": 1 } } preamble " + json.dumps(VALID_INVOICE) + " tail { \"x\": 2 }"
+        data = Extractor._parse_json(raw)
+        self.assertEqual(data["invoice_number"], "INV-STUB-2026-001")
+
+    def test_fenced_null_byte_pretty(self):
+        raw = "Sure! Here it is:\n```json\n" + json.dumps(VALID_INVOICE, indent=2) + "\n```\nAll done."
+        data = Extractor._parse_json(raw)
+        self.assertEqual(data["invoice_number"], "INV-STUB-2026-001")
+
+    def test_truncated_json_raises(self):
+        with self.assertRaises(ExtractorError):
+            Extractor._parse_json('{"invoice_number": "INV-1", "total_amount": 1')
+
+    def test_empty_content_raises(self):
+        with self.assertRaises(ExtractorError):
+            Extractor._parse_json("   ")
 
 
 class PdfTextHeuristicTest(unittest.TestCase):

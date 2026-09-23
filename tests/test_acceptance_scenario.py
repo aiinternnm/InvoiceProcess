@@ -80,7 +80,7 @@ class FakeDrive:
         self.files = files
         self.content = content
 
-    def list_folder(self, folder_id, recursive=True, allowed_extensions=None):
+    def list_folder(self, folder_id, recursive=True, allowed_extensions=None, **kwargs):
         return list(self.files)
 
     def download(self, file_meta, dest_dir, max_size_mb=None, verify_md5=False):

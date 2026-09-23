@@ -34,8 +34,15 @@ Nothing is bound to any particular development machine.
   3. Invoice fingerprint = `InvoiceNo + VendorGSTIN + InvoiceDate + TotalAmount` (tertiary)
 * Downloads each new file, **verifies it** (optional md5 integrity check), sends its actual
   content — extracted PDF text or rendered page images / base64 image data — to **Qwen 3.5 9B**
-  running in **LM Studio**, and asks for strict structured JSON. The model never fabricates:
+  running in **LM Studio**, and asks for strict structured **JSON**. The model never fabricates:
   missing/uncertain fields are `null` and flagged for review.
+* **JSON is primary; XML is the fallback.** If the JSON reply is malformed, truncated/unusable,
+  or parses but fails validation ("reject" level), the extractor makes exactly ONE controlled
+  second request asking Qwen for strict **XML** (same canonical schema, never uses
+  `response_format`), parses it with an XXE/entity-expansion guard, and maps it into the same
+  canonical invoice object that validation and Excel consume — so a fallback never creates a
+  second record. If both fail, the file is marked `failed`. Which format produced each record
+  is captured in the audit as `source_format` / `xml_fallback`.
 * Validates numbers/dates, checks tax arithmetic (`taxable + CGST + SGST + IGST ≈ total`),
   and classifies every record as **append / review / reject**.
 * Appends only genuinely new, valid invoices to the existing `details` sheet of the provided
@@ -108,12 +115,13 @@ The service account can only see files/folders explicitly shared with it.
 |---|---|
 | `drive.service_account_json` | Path to the service-account key (relative to config.json, i.e. `credentials/service_account.json`). |
 | `drive.folder_id` / `drive.folder_url` | The office folder. One of the two is enough. |
+| `drive.corpora` / `drive.drive_id` | Shared Drive access. When the folder lives in a **Shared Drive**, set `drive.corpora` to `drive` and `drive.drive_id` to the **top-level Shared Drive ID** (right-click the Shared Drive → Settings → "ID" / the URL segment after `folders/...` of the drive root). Leave both empty for a plain My Drive folder. The scanner always sends `supportsAllDrives=true` + `includeItemsFromAllDrives=true` so shared-drive files are found; these two keys narrow the search to the exact shared drive (avoids `allDrives` incomplete-search risk). |
 | `drive.verify_download_md5` | `true` = verify downloaded bytes against Drive's `md5Checksum` (whole-file MD5 for files ≤ 5 MB; corrupt downloads fail isolately). Default `false`. |
 | `model.base_url` | `http://localhost:1234/v1` when Python and LM Studio share the office PC. |
 | `model.api_key` | `lm-studio` for local; the ngrok auth key only if using ngrok. |
 | `model.model` | The exact model id loaded in LM Studio. |
 | `model.vision_enabled` | `true` = Qwen reads images/scanned PDFs. |
-| `model.max_tokens` | Response cap for long invoices (default `4096`). |
+| `model.max_tokens` | Completion cap. Qwen3.5 "thinking" counts fully against it, so give generous headroom for reasoning + a 45-field invoice JSON (default `8192`). If you see "truncated / reasoning-only" errors, raise it further or disable thinking in LM Studio. |
 | `excel.template_path` | The provided template relative to config.json. |
 | `excel.target_sheet` | `details` (kept). |
 | `excel.lineitems_sheet` / `processed_ids_sheet` | `Details_LineItems` / `_DocParser_ProcessedIDs` (kept). |
@@ -134,6 +142,8 @@ project can sit in any folder on the office PC. A ready-to-fill template is in
 ```powershell
 python main.py                 # full pipeline (MCP Excel writes enabled by default)
 python main.py --dry-run       # full scan + extraction, writes nothing
+python main.py --step          # trial mode: process one file, then ask to continue or stop
+python main.py --limit 25      # process at most the first 25 files and stop (no prompting)
 python main.py --mock-extract  # inject a sample invoice instead of calling Qwen (still needs Drive)
 python main.py --test-model    # ping the Qwen/LM Studio endpoint only
 python main.py --folder "https://drive.google.com/drive/folders/<ID>"  # override folder for one run

@@ -14,6 +14,8 @@ _DEFAULTS: Dict[str, Any] = {
         "folder_id": "",
         "folder_url": "",
         "recursive": True,
+        "corpora": "",
+        "drive_id": "",
         "allowed_extensions": [".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp", ".gif"],
         "download_dir": "data/downloads",
         "max_file_size_mb": 50,
@@ -35,7 +37,7 @@ _DEFAULTS: Dict[str, Any] = {
         "api_key": "lm-studio",
         "model": "qwen3.5-9b-instruct",
         "temperature": 0,
-        "max_tokens": 4096,
+        "max_tokens": 8192,
         "timeout_seconds": 300,
         "vision_enabled": True,
         "min_pdf_text_chars": 40,
@@ -130,6 +132,18 @@ def load_config(path: str = "config.json") -> Dict[str, Any]:
 def _validate(cfg: Dict[str, Any]) -> None:
     if not cfg["drive"].get("folder_id") and not cfg["drive"].get("folder_url"):
         raise ValueError("config.json: provide drive.folder_id or drive.folder_url.")
+    corpora = str(cfg["drive"].get("corpora") or "").lower()
+    if corpora and corpora not in ("user", "drive", "allDrives", "domain"):
+        raise ValueError(
+            f"config.json: drive.corpora must be one of 'user', 'drive', 'allDrives', "
+            f"'domain' or empty (got {corpora!r})."
+        )
+    if corpora == "drive" and not cfg["drive"].get("drive_id"):
+        raise ValueError(
+            "config.json: drive.corpora is 'drive' but drive.drive_id is empty. "
+            "Set drive.drive_id to the top-level Shared Drive ID (the ID of the shared "
+            "drive itself, not the sub-folder)."
+        )
     if not os.path.exists(cfg["excel"]["template_path"]):
         raise FileNotFoundError(f"Excel template not found: {cfg['excel']['template_path']}")
     placeholder = "YOUR_NGROK_URL"

@@ -2,7 +2,8 @@
 
 Usage:
     python main.py [--config config.json] [--folder <link-or-id>] [--dry-run]
-                   [--mock-extract] [--test-model] [--skip-model-check]
+                   [--step] [--limit N] [--mock-extract] [--test-model]
+                   [--skip-model-check]
 
 Flow per file:
   Drive discovery -> file-ID dedupe -> size gate (pre-download) ->
@@ -85,6 +86,10 @@ def main() -> int:
     parser.add_argument("--config", default="config.json")
     parser.add_argument("--folder", help="Drive folder link or ID (overrides config.json)")
     parser.add_argument("--dry-run", action="store_true", help="Extract & validate but do not write Excel / ledger.")
+    parser.add_argument("--step", action="store_true",
+                        help="Trial step-through mode: pause after each file and ask whether to continue.")
+    parser.add_argument("--limit", type=int, default=0,
+                        help="Process at most the first N files this run and stop (0 = all).")
     parser.add_argument("--mock-extract", action="store_true", help="Skip the model; inject a mock invoice (tests Excel mapping).")
     parser.add_argument("--test-model", action="store_true", help="Ping the Qwen endpoint and exit.")
     parser.add_argument("--skip-model-check", action="store_true", help="Do not fail fast when model is unreachable.")
@@ -143,9 +148,15 @@ def main() -> int:
     # ---- Drive ------------------------------------------------------------
     drive = DriveClient(drive_cfg["service_account_json"])
     try:
-        files = drive.list_folder(drive_cfg["folder_id"],
-                                  recursive=drive_cfg.get("recursive", True),
-                                  allowed_extensions=drive_cfg.get("allowed_extensions"))
+        list_kwargs: Dict[str, Any] = {
+            "recursive": drive_cfg.get("recursive", True),
+            "allowed_extensions": drive_cfg.get("allowed_extensions"),
+        }
+        if drive_cfg.get("corpora"):
+            list_kwargs["corpora"] = drive_cfg["corpora"]
+        if drive_cfg.get("drive_id"):
+            list_kwargs["drive_id"] = drive_cfg["drive_id"]
+        files = drive.list_folder(drive_cfg["folder_id"], **list_kwargs)
     except (DriveError, Exception) as exc:  # noqa: BLE001
         log.error("Drive scan failed: %s", exc)
         return 3
@@ -169,7 +180,18 @@ def main() -> int:
                                 "skip_noninvoice": 0, "review_filter": 0}
 
     # ---- process loop -----------------------------------------------------
-    for file_meta in _sorted(files):
+    pending = _sorted(files)
+    if args.limit and len(pending) > args.limit:
+        pending = pending[:args.limit]
+    total_files = len(pending)
+    step_processed = 0
+    for file_meta in pending:
+        if args.step and step_processed:
+            if not _step_continue(step_processed, total_files,
+                                  file_meta.get("name", ""), args.dry_run):
+                log.info("Step mode: stopping after %d of %d files.", step_processed, total_files)
+                break
+        step_processed += 1
         file_id = file_meta["id"]
         fname = file_meta.get("name", "")
         mime = file_meta.get("mimeType", "")
@@ -180,7 +202,8 @@ def main() -> int:
             "drive_md5": file_meta.get("md5Checksum"),
             "source_folder_id": drive_cfg["folder_id"], "folder_url": drive_cfg.get("folder_url", ""),
             "owner_name": owner["owner_name"], "owner_email": owner["owner_email"],
-            "qwen_status": "", "parse_error": "", "review_flags": "",
+            "qwen_status": "", "source_format": "", "xml_fallback": "",
+            "parse_error": "", "review_flags": "",
             "filter_status": "", "skip_reason": "", "filter_score": None,
         }
         try:
@@ -342,6 +365,8 @@ def main() -> int:
                    excel_row=row_idx, line_item_count=line_item_count,
                    latency_ms=meta.get("latency_ms"), input_tokens=meta.get("input_tokens"),
                    output_tokens=meta.get("output_tokens"), finish_reason=meta.get("finish_reason"),
+                   source_format=meta.get("source_format", "json"),
+                   xml_fallback=meta.get("xml_fallback", False),
                    review_flags="; ".join(vresult.reasons))
             log.info("[OK] row %s -> invoice %s (%s) total=%s",
                      row_idx, vresult.data.get("invoice_number"), fname, vresult.data.get("total_amount"))
@@ -417,6 +442,21 @@ def _ledger_status_for_filter(status: str) -> str:
 
 def _sorted(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(files, key=lambda f: (f.get("name", "").lower(), f.get("id", "")))
+
+
+def _step_continue(processed: int, total: int, next_name: str, dry: bool = False) -> bool:
+    """Ask the user whether to keep going in --step mode. Default = stop."""
+    label = "dry-run" if dry else "run"
+    prompt_msg = (
+        "[step] (%s) finished %d/%d files so far. Enter 'y' or 'continue' to process "
+        "the next file '%s'; anything else (or Enter / Ctrl+C) to stop: "
+        % (label, processed, total, next_name)
+    )
+    try:
+        reply = input(prompt_msg)
+    except EOFError:
+        return False
+    return reply.strip().lower() in ("y", "yes", "continue", "c")
 
 
 def _mark_seen(backpack, dupes: DuplicateChecker, file_id: str,

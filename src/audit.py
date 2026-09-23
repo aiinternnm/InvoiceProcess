@@ -18,7 +18,8 @@ _AUDIT_FIELDS = [
     "folder_url", "duplicate_status", "invoice_number", "vendor_gstin", "invoice_date",
     "total_amount", "extraction_status", "qwen_status", "parse_error", "review_flags",
     "confidence", "excel_row", "line_item_count", "latency_ms", "input_tokens",
-    "output_tokens", "finish_reason", "warning", "filter_status", "skip_reason",
+    "output_tokens", "finish_reason", "source_format", "xml_fallback",
+    "warning", "filter_status", "skip_reason",
     "filter_score",
 ]
 

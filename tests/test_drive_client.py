@@ -27,8 +27,15 @@ class _FakeFiles:
         self.calls = []
         self.media_calls = 0
 
-    def list(self, q=None, pageSize=None, fields=None, pageToken=None):
-        self.calls.append({"q": q, "pageToken": pageToken})
+    def list(self, q=None, pageSize=None, fields=None, pageToken=None,
+             supportsAllDrives=None, includeItemsFromAllDrives=None,
+             corpora=None, driveId=None):
+        self.calls.append({
+            "q": q, "pageToken": pageToken,
+            "supportsAllDrives": supportsAllDrives,
+            "includeItemsFromAllDrives": includeItemsFromAllDrives,
+            "corpora": corpora, "driveId": driveId,
+        })
         page = self.pages.pop(0) if self.pages else {"files": [], "nextPageToken": None}
         return _FakeRequest(page)
 
@@ -91,6 +98,37 @@ class DriveClientListTest(unittest.TestCase):
                               allowed_extensions=[".pdf", ".png"])
         self.assertEqual([f["id"] for f in files], ["f1", "f3"])
         self.assertTrue(any("'ROOT' in parents" in c["q"] for c in svc.files_api.calls))
+
+    def test_list_always_sends_shared_drive_booleans(self):
+        pages = [{"nextPageToken": None, "files": [
+            {"id": "f1", "name": "a.pdf", "mimeType": "application/pdf", "size": "1000",
+             "owners": [{"displayName": "A"}], "trashed": False}]}]
+        svc = _FakeSvc(pages)
+        c = self._client(svc)
+        c.list_folder("ROOT")
+        call = svc.files_api.calls[0]
+        self.assertTrue(call["supportsAllDrives"])
+        self.assertTrue(call["includeItemsFromAllDrives"])
+        self.assertIsNone(call["corpora"])
+        self.assertIsNone(call["driveId"])
+
+    def test_list_forwards_corpora_and_drive_id(self):
+        pages = [{"nextPageToken": None, "files": [
+            {"id": "f1", "name": "a.pdf", "mimeType": "application/pdf", "size": "1000",
+             "owners": [{"displayName": "A"}], "trashed": False}]}]
+        svc = _FakeSvc(pages)
+        c = self._client(svc)
+        c.list_folder("SUBFOLDER", corpora="drive", drive_id="0A-SHARED")
+        call = svc.files_api.calls[0]
+        self.assertEqual(call["corpora"], "drive")
+        self.assertEqual(call["driveId"], "0A-SHARED")
+        self.assertTrue(any("'SUBFOLDER' in parents" in c2["q"] for c2 in svc.files_api.calls))
+
+    def test_list_drive_corpora_requires_drive_id(self):
+        svc = _FakeSvc([{"nextPageToken": None, "files": []}])
+        c = self._client(svc)
+        with self.assertRaises(DriveError):
+            c.list_folder("ROOT", corpora="drive", drive_id=None)
 
     def test_supported_by_mime_when_extension_unknown(self):
         self.assertTrue(_is_supported("noext", "application/pdf", []))

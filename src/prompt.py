@@ -3,6 +3,12 @@
 If config 'extraction.prompt_override_file' points to a readable file,
 its contents are used verbatim.  Otherwise a structured default prompt
 is built automatically.
+
+The canonical field lists (:data:`SCHEMA_SCALAR_FIELDS` and
+:data:`SCHEMA_LINEITEM_FIELDS`) are the single source of truth for the
+invoice schema: the JSON schema string, the XML fallback schema, and the
+XML parser in :mod:`src.extractor` all reference them so JSON and XML always
+map to the same canonical invoice object.
 """
 from __future__ import annotations
 
@@ -120,6 +126,81 @@ JSON SCHEMA (return this structure):
   ]
 }
 """
+
+
+# Canonical top-level scalar fields (must mirror _SCHEMA_JSON and validator.py).
+SCHEMA_SCALAR_FIELDS = (
+    "invoice_number", "document_type", "original_invoice_ref", "invoice_date",
+    "due_date", "period_of_service", "vendor_name", "vendor_gstin",
+    "vendor_address", "vendor_email", "vendor_phone", "buyer_name", "buyer_gstin",
+    "buyer_address", "place_of_supply", "description_of_services_or_product",
+    "hsn_code", "quantity", "unit", "total_quantity", "taxable_value",
+    "cgst_rate", "cgst_amount", "sgst_rate", "sgst_amount", "igst_rate",
+    "igst_amount", "cess_rate", "cess_amount", "total_amount", "currency", "irn",
+    "ack_no", "ack_date", "payable_under_rcm", "dispatch_through", "eway_bill_no",
+    "motor_vehicle_no", "mode_of_payment", "reference_no", "other_reference",
+    "remarks", "invoice_category", "suggested_expense_category", "credit_terms",
+    "confidence",
+)
+
+# Canonical line-item fields (must mirror _SCHEMA_JSON and validator.py).
+SCHEMA_LINEITEM_FIELDS = (
+    "sl_no", "description", "hsn_code", "qty", "unit", "unit_rate",
+    "taxable_value", "cgst_rate", "cgst_amount", "sgst_rate", "sgst_amount",
+    "igst_rate", "igst_amount", "line_total", "asin",
+)
+
+_XML_ESCAPE_HINT = (
+    "Escape XML special characters in text values: & -> &amp;, < -> &lt;, "
+    "> -> &gt;. Use <field></field> (an empty element) for absent/null values. "
+    "No CDATA, no DOCTYPE, no comments, no markdown fences.\n"
+)
+
+
+def build_extraction_prompt_xml(cfg: Dict, mime_type: str) -> str:
+    """Instruction block for the Qwen JSON -> XML fallback request.
+
+    Asks Qwen to re-answer the SAME invoice with a strict XML representation of
+    the same canonical schema. The invoice/input itself travels in the original
+    message (text or image); this text is appended as a follow-up user turn.
+    """
+    template_lines = ["<invoice>"]
+    for tag in SCHEMA_SCALAR_FIELDS:
+        template_lines.append(f"  <{tag}></{tag}>")
+    template_lines.append("  <uncertain_fields>")
+    template_lines.append("    <field>field_name_one</field>")
+    template_lines.append("  </uncertain_fields>")
+    template_lines.append("  <line_items>")
+    template_lines.append("    <line_item>")
+    for tag in SCHEMA_LINEITEM_FIELDS:
+        template_lines.append(f"      <{tag}></{tag}>")
+    template_lines.append("    </line_item>")
+    template_lines.append("  </line_items>")
+    template_lines.append("</invoice>")
+    xml_schema = "\n".join(template_lines)
+
+    return (
+        "Your previous reply did not come back as usable structured JSON, so "
+        "answer the SAME invoice input one more time, but this time output ONLY "
+        "a single XML document that exactly matches this structure:\n\n"
+        + xml_schema
+        + "\n\nRULES:\n"
+        "1. One <invoice> root with exactly these tag names. Repeat <line_item> "
+        "for every line-item row; omit nothing.\n"
+        "2. Text inside a tag is the raw value: numbers as plain numbers (no "
+        "currency symbols, no thousands separators, e.g. 14750 or 11800.00), "
+        "dates as YYYY-MM-DD.\n"
+        "3. <uncertain_fields> holds the names of fields you are unsure about; "
+        "empty element if none.\n"
+        "4. Do NOT invent values. If a field is genuinely absent/unreadable use "
+        "an empty element.\n"
+        "5. The value semantics are identical to the JSON schema you were given:\n"
+        "   total_amount is the grand total incl. all taxes; taxable_value is "
+        "   pre-tax; keep negative signs for credit adjusts; preserve every "
+        "   line-item row.\n"
+        + _XML_ESCAPE_HINT
+        + "Output nothing but the XML document."
+    )
 
 
 def build_extraction_prompt(cfg: Dict, mime_type: str) -> str:
